@@ -12,7 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 LRUReplacer::LRUReplacer(size_t num_pages) { max_size_ = num_pages; }
 
-LRUReplacer::~LRUReplacer() = default;  
+LRUReplacer::~LRUReplacer() = default;
 
 /**
  * @description: 使用LRU策略删除一个victim frame，并返回该frame的id
@@ -27,7 +27,13 @@ bool LRUReplacer::victim(frame_id_t* frame_id) {
     // Todo:
     //  利用lru_replacer中的LRUlist_,LRUHash_实现LRU策略
     //  选择合适的frame指定为淘汰页面,赋值给*frame_id
-
+    if (LRUlist_.empty()) {
+        return false;
+    }
+    frame_id_t fid = LRUlist_.front();
+    LRUlist_.pop_front();
+    LRUhash_.erase(fid);
+    *frame_id = fid;
     return true;
 }
 
@@ -40,6 +46,11 @@ void LRUReplacer::pin(frame_id_t frame_id) {
     // Todo:
     // 固定指定id的frame
     // 在数据结构中移除该frame
+    auto it = LRUhash_.find(frame_id);
+    if (it != LRUhash_.end()) {
+        LRUlist_.erase(it->second);
+        LRUhash_.erase(it);
+    }
 }
 
 /**
@@ -50,6 +61,17 @@ void LRUReplacer::unpin(frame_id_t frame_id) {
     // Todo:
     //  支持并发锁
     //  选择一个frame取消固定
+    std::scoped_lock lock{latch_};
+    if (LRUhash_.find(frame_id) != LRUhash_.end()) {
+        return;
+    }
+    if (LRUlist_.size() >= max_size_) {
+        // If full, do nothing; replacer tracks up to pool size
+        return;
+    }
+    LRUlist_.push_back(frame_id);
+    auto iter = std::prev(LRUlist_.end());
+    LRUhash_[frame_id] = iter;
 }
 
 /**
