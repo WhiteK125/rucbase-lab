@@ -196,9 +196,56 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
  * @param {string&} tab_name 表的名称
  * @param {vector<string>&} col_names 索引包含的字段名称
  * @param {Context*} context
+ * 
+ * 实现思路：
+ * 1. 检查表是否存在
+ * 2. 检查索引是否已存在（在元数据中）
+ * 3. 从表元数据中获取索引字段的ColMeta信息
+ * 4. 如果索引文件已存在于磁盘上，先删除它（处理元数据和文件不一致的情况）
+ * 5. 调用ix_manager_创建索引文件
+ * 6. 更新表元数据，记录新索引
  */
 void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
+    // 1. 检查表是否存在
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
     
+    // 获取表元数据
+    TabMeta& tab = db_.get_table(tab_name);
+    
+    // 2. 检查索引是否已存在（在元数据中）
+    if (tab.is_index(col_names)) {
+        throw IndexExistsError(tab_name, col_names);
+    }
+    
+    // 3. 从表元数据中获取索引字段的ColMeta信息
+    std::vector<ColMeta> index_cols;
+    int col_tot_len = 0;
+    for (const auto& col_name : col_names) {
+        auto col_it = tab.get_col(col_name);
+        index_cols.push_back(*col_it);
+        col_tot_len += col_it->len;
+    }
+    
+    // 4. 如果索引文件已存在于磁盘上，先删除它（处理元数据和文件不一致的情况）
+    if (ix_manager_->exists(tab_name, index_cols)) {
+        ix_manager_->destroy_index(tab_name, index_cols);
+    }
+    
+    // 5. 调用ix_manager_创建索引文件
+    ix_manager_->create_index(tab_name, index_cols);
+    
+    // 6. 更新表元数据，记录新索引
+    IndexMeta index_meta;
+    index_meta.tab_name = tab_name;
+    index_meta.col_tot_len = col_tot_len;
+    index_meta.col_num = col_names.size();
+    index_meta.cols = index_cols;
+    tab.indexes.push_back(index_meta);
+    
+    // 刷新元数据到磁盘
+    flush_meta();
 }
 
 /**
