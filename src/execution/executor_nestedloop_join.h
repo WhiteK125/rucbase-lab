@@ -248,6 +248,9 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
      * 需要处理两种情况：
      * 1. 条件两边都是列（如 A.id = B.aid）
      * 2. 条件一边是列，一边是常量值（如 A.id = 1）
+     * 
+     * 注意：left_->cols() 和 right_->cols() 返回的是子算子原始的列信息，
+     * 偏移量是从0开始的，直接用于访问对应记录即可。
      */
     bool check_join_condition(RmRecord *left_rec, RmRecord *right_rec, const Condition &cond) {
         // 获取左边列的数据
@@ -255,7 +258,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         ColType lhs_type;
         int lhs_len;
         
-        // 查找左边列属于哪个表
+        // 获取左右子算子的原始列信息（offset从0开始）
         auto &left_cols = left_->cols();
         auto &right_cols = right_->cols();
         
@@ -266,12 +269,12 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
             });
         
         if (lhs_col_it != left_cols.end()) {
-            // 左边列在左表中
+            // 左边列在左表中，直接使用原始offset访问left_rec
             lhs_data = left_rec->data + lhs_col_it->offset;
             lhs_type = lhs_col_it->type;
             lhs_len = lhs_col_it->len;
         } else {
-            // 左边列在右表中（需要减去左表长度得到原始偏移量）
+            // 左边列在右表中，使用原始offset访问right_rec
             auto it = std::find_if(right_cols.begin(), right_cols.end(),
                 [&](const ColMeta &col) {
                     return col.tab_name == cond.lhs_col.tab_name && col.name == cond.lhs_col.col_name;
@@ -279,8 +282,8 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
             if (it == right_cols.end()) {
                 throw ColumnNotFoundError(cond.lhs_col.tab_name + "." + cond.lhs_col.col_name);
             }
-            // 注意：right_cols中的offset已经加上了left_tupleLen，所以需要减去
-            lhs_data = right_rec->data + (it->offset - left_->tupleLen());
+            // right_cols中的offset是原始的（从0开始），直接用于访问right_rec
+            lhs_data = right_rec->data + it->offset;
             lhs_type = it->type;
             lhs_len = it->len;
         }
@@ -322,7 +325,8 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
                 if (it == right_cols.end()) {
                     throw ColumnNotFoundError(cond.rhs_col.tab_name + "." + cond.rhs_col.col_name);
                 }
-                rhs_data = right_rec->data + (it->offset - left_->tupleLen());
+                // 使用原始offset访问right_rec
+                rhs_data = right_rec->data + it->offset;
                 rhs_type = it->type;
                 rhs_len = it->len;
             }
