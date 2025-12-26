@@ -102,10 +102,21 @@ class UpdateExecutor : public AbstractExecutor {
                     throw IncompatibleTypeError(coltype2str(col_it->type), coltype2str(set_clause.rhs.type));
                 }
                 
-                // 将新值写入新记录的对应位置
-                Value val = set_clause.rhs;
-                val.init_raw(col_it->len);
-                memcpy(new_rec.data + col_it->offset, val.raw->data, col_it->len);
+                // 将新值直接写入新记录的对应位置
+                // 注意：不使用init_raw()，因为在多条记录更新时会被重复调用导致断言失败
+                char *dest = new_rec.data + col_it->offset;
+                if (col_it->type == TYPE_INT) {
+                    // 整数类型：直接复制int值
+                    memcpy(dest, &set_clause.rhs.int_val, sizeof(int));
+                } else if (col_it->type == TYPE_FLOAT) {
+                    // 浮点类型：直接复制float值
+                    memcpy(dest, &set_clause.rhs.float_val, sizeof(float));
+                } else if (col_it->type == TYPE_STRING) {
+                    // 字符串类型：先清零，再复制字符串内容
+                    memset(dest, 0, col_it->len);
+                    memcpy(dest, set_clause.rhs.str_val.c_str(), 
+                           std::min((size_t)col_it->len, set_clause.rhs.str_val.size()));
+                }
             }
             
             // Step 3: 更新索引
