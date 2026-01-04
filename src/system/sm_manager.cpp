@@ -261,21 +261,33 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
 /**
  * @description: 删除表
  * @param {string&} tab_name 表的名称
- * @param {Context*} context 上下文信息，用于事务和锁管理（当前实验可忽略）
+ * @param {Context*} context 上下文信息，用于事务和锁管理
  *
  * 实现思路：
- * 1. 获取表的元数据，检查表是否存在
- * 2. 关闭并删除表上的所有索引文件
- * 3. 关闭并删除表的记录文件
- * 4. 从数据库元数据中删除该表的信息
- * 5. 刷新元数据到磁盘
+ * 1. 申请表级排他锁（X锁）保证删除操作的独占性
+ * 2. 获取表的元数据，检查表是否存在
+ * 3. 关闭并删除表上的所有索引文件
+ * 4. 关闭并删除表的记录文件
+ * 5. 从数据库元数据中删除该表的信息
+ * 6. 刷新元数据到磁盘
+ * 
+ * 加锁说明：
+ * - drop_table是DDL操作，需要申请表级X锁
+ * - X锁与所有其他锁都不相容，保证删除时没有其他事务在访问该表
  */
 void SmManager::drop_table(const std::string& tab_name, Context* context) {
     // Step 1: 获取表的元数据
     // get_table会检查表是否存在，不存在会抛出TableNotFoundError
     TabMeta& tab = db_.get_table(tab_name);
 
-    // Step 2: 关闭并删除表上的所有索引文件
+    // Step 2: 申请表级排他锁（X锁）
+    // DDL操作需要独占访问表，防止其他事务同时访问
+    if (context != nullptr && context->lock_mgr_ != nullptr && 
+        context->txn_ != nullptr && fhs_.count(tab_name)) {
+        context->lock_mgr_->lock_exclusive_on_table(context->txn_, fhs_.at(tab_name)->GetFd());
+    }
+
+    // Step 3: 关闭并删除表上的所有索引文件
     // 遍历表的所有索引，先关闭索引句柄，再删除索引文件
     for (auto& index : tab.indexes) {
         // 获取索引文件名
@@ -292,7 +304,7 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
         ix_manager_->destroy_index(tab_name, index.cols);
     }
 
-    // Step 3: 关闭并删除表的记录文件
+    // Step 4: 关闭并删除表的记录文件
     // 先关闭文件句柄
     if (fhs_.count(tab_name)) {
         rm_manager_->close_file(fhs_.at(tab_name).get());
@@ -301,10 +313,10 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
     // 删除记录文件
     rm_manager_->destroy_file(tab_name);
 
-    // Step 4: 从数据库元数据中删除该表
+    // Step 5: 从数据库元数据中删除该表
     db_.tabs_.erase(tab_name);
 
-    // Step 5: 刷新元数据到磁盘，确保删除操作持久化
+    // Step 6: 刷新元数据到磁盘，确保删除操作持久化
     flush_meta();
 }
 
@@ -312,18 +324,23 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
  * @description: 创建索引
  * @param {string&} tab_name 表的名称
  * @param {vector<string>&} col_names 索引包含的字段名称
- * @param {Context*} context
+ * @param {Context*} context 上下文信息，用于事务和锁管理
  *
  * 实现思路：
  * 1. 检查表是否存在
- * 2. 检查索引是否已存在（在元数据中）
- * 3. 从表元数据中获取索引字段的ColMeta信息
- * 4. 如果索引文件已存在于磁盘上，先删除它（处理元数据和文件不一致的情况）
- * 5. 调用ix_manager_创建索引文件
- * 6. 更新表元数据，记录新索引
+ * 2. 申请表级意向排他锁（IX锁）
+ * 3. 检查索引是否已存在（在元数据中）
+ * 4. 从表元数据中获取索引字段的ColMeta信息
+ * 5. 如果索引文件已存在于磁盘上，先删除它（处理元数据和文件不一致的情况）
+ * 6. 调用ix_manager_创建索引文件
+ * 7. 更新表元数据，记录新索引
+ * 
+ * 加锁说明：
+ * - create_index是DDL操作，需要申请表级IX锁
+ * - IX锁表示事务将要修改表的结构
  */
 void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
-    // 1. 检查表是否存在
+    // Step 1: 检查表是否存在
     if (!db_.is_table(tab_name)) {
         throw TableNotFoundError(tab_name);
     }
@@ -331,12 +348,19 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     // 获取表元数据
     TabMeta& tab = db_.get_table(tab_name);
 
-    // 2. 检查索引是否已存在（在元数据中）
+    // Step 2: 申请表级意向排他锁（IX锁）
+    // 创建索引需要独占访问表结构
+    if (context != nullptr && context->lock_mgr_ != nullptr && 
+        context->txn_ != nullptr && fhs_.count(tab_name)) {
+        context->lock_mgr_->lock_IX_on_table(context->txn_, fhs_.at(tab_name)->GetFd());
+    }
+
+    // Step 3: 检查索引是否已存在（在元数据中）
     if (tab.is_index(col_names)) {
         throw IndexExistsError(tab_name, col_names);
     }
 
-    // 3. 从表元数据中获取索引字段的ColMeta信息
+    // Step 4: 从表元数据中获取索引字段的ColMeta信息
     std::vector<ColMeta> index_cols;
     int col_tot_len = 0;
     for (const auto& col_name : col_names) {
@@ -345,15 +369,15 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
         col_tot_len += col_it->len;
     }
 
-    // 4. 如果索引文件已存在于磁盘上，先删除它（处理元数据和文件不一致的情况）
+    // Step 5: 如果索引文件已存在于磁盘上，先删除它（处理元数据和文件不一致的情况）
     if (ix_manager_->exists(tab_name, index_cols)) {
         ix_manager_->destroy_index(tab_name, index_cols);
     }
 
-    // 5. 调用ix_manager_创建索引文件
+    // Step 6: 调用ix_manager_创建索引文件
     ix_manager_->create_index(tab_name, index_cols);
 
-    // 6. 更新表元数据，记录新索引
+    // Step 7: 更新表元数据，记录新索引
     IndexMeta index_meta;
     index_meta.tab_name = tab_name;
     index_meta.col_tot_len = col_tot_len;
@@ -369,15 +393,20 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
  * @description: 删除索引
  * @param {string&} tab_name 表名称
  * @param {vector<string>&} col_names 索引包含的字段名称
- * @param {Context*} context 上下文信息
+ * @param {Context*} context 上下文信息，用于事务和锁管理
  *
  * 实现思路：
  * 1. 检查表是否存在
- * 2. 检查索引是否存在于表的元数据中
- * 3. 从ihs_中关闭并移除索引句柄
- * 4. 删除磁盘上的索引文件
- * 5. 从表元数据中移除索引信息
- * 6. 刷新元数据到磁盘
+ * 2. 申请表级意向排他锁（IX锁）
+ * 3. 检查索引是否存在于表的元数据中
+ * 4. 从ihs_中关闭并移除索引句柄
+ * 5. 删除磁盘上的索引文件
+ * 6. 从表元数据中移除索引信息
+ * 7. 刷新元数据到磁盘
+ * 
+ * 加锁说明：
+ * - drop_index是DDL操作，需要申请表级IX锁
+ * - IX锁表示事务将要修改表的结构
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
     // Step 1: 检查表是否存在
@@ -388,12 +417,19 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
     // 获取表元数据
     TabMeta& tab = db_.get_table(tab_name);
 
-    // Step 2: 检查索引是否存在
+    // Step 2: 申请表级意向排他锁（IX锁）
+    // 删除索引需要独占访问表结构
+    if (context != nullptr && context->lock_mgr_ != nullptr && 
+        context->txn_ != nullptr && fhs_.count(tab_name)) {
+        context->lock_mgr_->lock_IX_on_table(context->txn_, fhs_.at(tab_name)->GetFd());
+    }
+
+    // Step 3: 检查索引是否存在
     if (!tab.is_index(col_names)) {
         throw IndexNotFoundError(tab_name, col_names);
     }
 
-    // Step 3: 获取索引文件名并关闭索引句柄
+    // Step 4: 获取索引文件名并关闭索引句柄
     // 首先需要获取列的ColMeta信息，用于构建索引文件名
     std::vector<ColMeta> index_cols;
     for (const auto& col_name : col_names) {
@@ -402,7 +438,7 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
     }
     std::string ix_name = ix_manager_->get_index_name(tab_name, index_cols);
 
-    // 如果索引句柄存在于ihs_中，先关闭它
+    // Step 5: 如果索引句柄存在于ihs_中，先关闭它
     if (ihs_.count(ix_name)) {
         ix_manager_->close_index(ihs_.at(ix_name).get());
         ihs_.erase(ix_name);
