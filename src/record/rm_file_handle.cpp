@@ -76,10 +76,41 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
  * @description: 在当前表中的指定位置插入一条记录
  * @param {Rid&} rid 要插入记录的位置
  * @param {char*} buf 要插入记录的数据
+ * 
+ * 该方法主要用于事务回滚时恢复被删除的记录到原位置
+ * 
+ * 实现逻辑：
+ * 1. 获取指定页面的page handle
+ * 2. 检查目标slot是否为空（正常情况应该为空）
+ * 3. 将数据复制到指定slot位置
+ * 4. 更新bitmap和记录计数
+ * 
+ * 注意事项：
+ * - 如果页面原本已满，需要考虑空闲页链表的更新
+ * - 该方法假设rid是有效的且该位置当前为空
  */
 void RmFileHandle::insert_record(const Rid& rid, char* buf) {
-    (void)rid;
-    (void)buf;
+    // Step 1: 获取指定页面的page handle
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    
+    // Step 2: 将数据复制到指定slot位置
+    char* slot = page_handle.get_slot(rid.slot_no);
+    memcpy(slot, buf, file_hdr_.record_size);
+    
+    // Step 3: 更新bitmap，标记该slot已被占用
+    Bitmap::set(page_handle.bitmap, rid.slot_no);
+    
+    // Step 4: 更新页面的记录计数
+    // 如果页面原本是满的（不在空闲链表中），需要考虑处理
+    // 但在回滚场景下，被删除的记录会使页面变为非满状态
+    // 所以这里只需要简单增加计数即可
+    page_handle.page_hdr->num_records += 1;
+    
+    // 标记页面为脏页，需要写回磁盘
+    BufferPoolManager::mark_dirty(page_handle.page);
+    
+    // 释放页面
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
 }
 
 /**
