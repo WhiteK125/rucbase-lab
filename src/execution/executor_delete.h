@@ -28,9 +28,11 @@ See the Mulan PSL v2 for more details. */
  * 提前收集好的所有满足WHERE条件的记录位置。
  *
  * 工作流程：
- * 1. 遍历rids_中的每个记录位置
- * 2. 对于每条记录，先删除其在所有索引中的索引项
- * 3. 然后删除记录文件中的数据
+ * 1. 申请表级意向排他锁（IX锁）
+ * 2. 遍历rids_中的每个记录位置
+ * 3. 对于每条记录，先记录写操作（用于回滚）
+ * 4. 删除其在所有索引中的索引项
+ * 5. 然后删除记录文件中的数据
  */
 class DeleteExecutor : public AbstractExecutor {
    private:
@@ -69,23 +71,39 @@ class DeleteExecutor : public AbstractExecutor {
      * @return nullptr（删除操作不返回记录）
      *
      * 删除流程：
-     * 1. 遍历所有需要删除的记录（rids_）
-     * 2. 对于每条记录：
-     *    a. 先读取记录内容（用于删除索引项）
-     *    b. 删除该记录在所有索引中的索引项
-     *    c. 删除记录文件中的数据
+     * 1. 申请表级意向排他锁（IX锁）
+     * 2. 遍历所有需要删除的记录（rids_）
+     * 3. 对于每条记录：
+     *    a. 先读取记录内容（用于回滚和删除索引项）
+     *    b. 记录写操作（用于事务回滚）
+     *    c. 删除该记录在所有索引中的索引项
+     *    d. 删除记录文件中的数据
      *
-     * 重要：必须先删除索引项再删除记录，
-     * 因为删除记录后就无法获取索引键值了。
+     * 重要：
+     * - 必须先读取记录再删除，因为删除后数据就不存在了
+     * - 必须记录写操作以支持事务回滚
      */
     std::unique_ptr<RmRecord> Next() override {
-        // 遍历所有需要删除的记录
+        // Step 1: 申请表级意向排他锁（IX锁）
+        // IX锁表示事务将要在该表的某些记录上申请排他锁
+        if (context_ != nullptr && context_->lock_mgr_ != nullptr && context_->txn_ != nullptr) {
+            context_->lock_mgr_->lock_IX_on_table(context_->txn_, fh_->GetFd());
+        }
+        
+        // Step 2: 遍历所有需要删除的记录
         for (auto& rid : rids_) {
-            // Step 1: 读取记录内容（用于构造索引键）
+            // Step 2.1: 读取记录内容（用于构造索引键和回滚）
             // 必须在删除记录之前读取，因为删除后数据就不存在了
             auto rec = fh_->get_record(rid, context_);
 
-            // Step 2: 删除该记录在所有索引中的索引项
+            // Step 2.2: 记录写操作（用于事务回滚）
+            // DELETE操作需要记录rid和原始数据，回滚时将数据插入回原位置
+            if (context_ != nullptr && context_->txn_ != nullptr) {
+                WriteRecord* write_record = new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec);
+                context_->txn_->append_write_record(write_record);
+            }
+
+            // Step 2.3: 删除该记录在所有索引中的索引项
             // 遍历表上的所有索引
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto& index = tab_.indexes[i];
@@ -112,7 +130,7 @@ class DeleteExecutor : public AbstractExecutor {
                 delete[] key;
             }
 
-            // Step 3: 删除记录文件中的数据
+            // Step 2.4: 删除记录文件中的数据
             // 使用rid定位并删除记录
             fh_->delete_record(rid, context_);
         }

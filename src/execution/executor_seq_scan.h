@@ -95,12 +95,24 @@ class SeqScanExecutor : public AbstractExecutor {
      *
      * 创建表迭代器RmScan，然后不断调用next()直到找到第一条
      * 满足所有条件的记录，或者扫描结束。
+     * 
+     * 加锁说明：
+     * - 在扫描表之前，需要先申请表级意向共享锁（IS锁）
+     * - IS锁表示事务打算在表的某些行上加S锁
+     * - 行级S锁在get_record时自动申请
      */
     void beginTuple() override {
-        // 创建表扫描迭代器，RmScan会自动定位到第一条记录
+        // Step 1: 申请表级意向共享锁（IS锁）
+        // IS锁表示事务将要在该表的某些记录上申请共享锁
+        // 这是多粒度锁协议的要求：申请行级锁前必须先申请表级意向锁
+        if (context_ != nullptr && context_->lock_mgr_ != nullptr && context_->txn_ != nullptr) {
+            context_->lock_mgr_->lock_IS_on_table(context_->txn_, fh_->GetFd());
+        }
+        
+        // Step 2: 创建表扫描迭代器，RmScan会自动定位到第一条记录
         scan_ = std::make_unique<RmScan>(fh_);
 
-        // 找到第一条满足条件的记录
+        // Step 3: 找到第一条满足条件的记录
         while (!scan_->is_end()) {
             rid_ = scan_->rid();  // 获取当前记录的位置
             // 读取当前记录并检查是否满足条件

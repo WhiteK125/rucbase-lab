@@ -13,23 +13,42 @@ See the Mulan PSL v2 for more details. */
 /**
  * @description: 获取当前表中记录号为rid的记录
  * @param {Rid&} rid 记录号，指定记录的位置
- * @param {Context*} context
+ * @param {Context*} context 上下文信息，包含事务和锁管理器
  * @return {unique_ptr<RmRecord>} rid对应的记录对象指针
+ * 
+ * 实现逻辑：
+ * 1. 申请行级共享锁（S锁）以保证读取一致性
+ * 2. 获取指定记录所在的page handle
+ * 3. 初始化一个指向RmRecord的指针
+ * 
+ * 加锁说明：
+ * - 读操作需要申请S锁，防止其他事务同时修改该记录
+ * - 在申请行级锁之前，需要先申请表级意向锁（IS锁）
+ * - 意向锁的申请在executor层完成
  */
 std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* context) const {
-    // Todo:
-    // 1. 获取指定记录所在的page handle
-    // 2. 初始化一个指向RmRecord的指针（赋值其内部的data和size）
-    (void)context;
+    // Step 1: 申请行级共享锁（如果有事务上下文）
+    // 读取记录需要S锁，防止脏读（读取到其他事务未提交的数据）
+    if (context != nullptr && context->lock_mgr_ != nullptr && context->txn_ != nullptr) {
+        context->lock_mgr_->lock_shared_on_record(context->txn_, rid, fd_);
+    }
+    
+    // Step 2: 获取指定记录所在的page handle
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    
+    // Step 3: 检查记录是否存在
     if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
-        // 记录不存在
+        // 记录不存在，释放页面并抛出异常
         buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
     }
+    
+    // Step 4: 初始化RmRecord并复制数据
     auto rec = std::make_unique<RmRecord>(file_hdr_.record_size);
     char* src = page_handle.get_slot(rid.slot_no);
     memcpy(rec->data, src, file_hdr_.record_size);
+    
+    // Step 5: 释放页面
     buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
     return rec;
 }
@@ -116,25 +135,50 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
 /**
  * @description: 删除记录文件中记录号为rid的记录
  * @param {Rid&} rid 要删除的记录的记录号（位置）
- * @param {Context*} context
+ * @param {Context*} context 上下文信息，包含事务和锁管理器
+ * 
+ * 实现逻辑：
+ * 1. 申请行级排他锁（X锁）以保证删除操作的独占性
+ * 2. 获取指定记录所在的page handle
+ * 3. 更新page_handle.page_hdr中的数据结构
+ * 
+ * 加锁说明：
+ * - 删除操作需要申请X锁，防止其他事务同时读取或修改该记录
+ * - X锁与其他所有锁都不相容
+ * - 在申请行级锁之前，需要先申请表级意向锁（IX锁）
+ * - 意向锁的申请在executor层完成
  */
 void RmFileHandle::delete_record(const Rid& rid, Context* context) {
-    // Todo:
-    // 1. 获取指定记录所在的page handle
-    // 2. 更新page_handle.page_hdr中的数据结构
-    // 注意考虑删除一条记录后页面未满的情况，需要调用release_page_handle()
-    (void)context;
+    // Step 1: 申请行级排他锁（如果有事务上下文）
+    // 删除记录需要X锁，防止其他事务读取到即将被删除的数据
+    if (context != nullptr && context->lock_mgr_ != nullptr && context->txn_ != nullptr) {
+        context->lock_mgr_->lock_exclusive_on_record(context->txn_, rid, fd_);
+    }
+    
+    // Step 2: 获取指定记录所在的page handle
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    
+    // Step 3: 检查记录是否存在
     if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
         buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
     }
+    
+    // Step 4: 检查页面原本是否已满
     bool was_full = (page_handle.page_hdr->num_records == file_hdr_.num_records_per_page);
+    
+    // Step 5: 更新bitmap，标记该slot为空闲
     Bitmap::reset(page_handle.bitmap, rid.slot_no);
+    
+    // Step 6: 更新记录计数
     page_handle.page_hdr->num_records -= 1;
+    
+    // Step 7: 如果页面原本已满，现在有空闲空间，需要加入空闲页链表
     if (was_full) {
         release_page_handle(page_handle);
     }
+    
+    // Step 8: 标记页面为脏页并释放
     BufferPoolManager::mark_dirty(page_handle.page);
     buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
 }
@@ -143,19 +187,39 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
  * @description: 更新记录文件中记录号为rid的记录
  * @param {Rid&} rid 要更新的记录的记录号（位置）
  * @param {char*} buf 新记录的数据
- * @param {Context*} context
+ * @param {Context*} context 上下文信息，包含事务和锁管理器
+ * 
+ * 实现逻辑：
+ * 1. 申请行级排他锁（X锁）以保证更新操作的独占性
+ * 2. 获取指定记录所在的page handle
+ * 3. 用新数据覆盖原记录
+ * 
+ * 加锁说明：
+ * - 更新操作需要申请X锁，防止其他事务同时读取或修改该记录
+ * - X锁与其他所有锁都不相容
+ * - 在申请行级锁之前，需要先申请表级意向锁（IX锁）
+ * - 意向锁的申请在executor层完成
  */
 void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
-    // Todo:
-    // 1. 获取指定记录所在的page handle
-    // 2. 更新记录
-    (void)context;
+    // Step 1: 申请行级排他锁（如果有事务上下文）
+    // 更新记录需要X锁，防止其他事务读取到不一致的数据
+    if (context != nullptr && context->lock_mgr_ != nullptr && context->txn_ != nullptr) {
+        context->lock_mgr_->lock_exclusive_on_record(context->txn_, rid, fd_);
+    }
+    
+    // Step 2: 获取指定记录所在的page handle
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    
+    // Step 3: 检查记录是否存在
     if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
         buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
     }
+    
+    // Step 4: 用新数据覆盖原记录
     memcpy(page_handle.get_slot(rid.slot_no), buf, file_hdr_.record_size);
+    
+    // Step 5: 标记页面为脏页并释放
     BufferPoolManager::mark_dirty(page_handle.page);
     buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
 }

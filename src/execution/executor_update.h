@@ -32,10 +32,12 @@ See the Mulan PSL v2 for more details. */
  * 所有满足WHERE条件的记录位置。
  *
  * 工作流程：
- * 1. 遍历rids_中的每个记录位置
- * 2. 读取原记录并构造新记录
- * 3. 更新涉及的索引（删除旧键，插入新键）
- * 4. 更新记录文件中的数据
+ * 1. 申请表级意向排他锁（IX锁）
+ * 2. 遍历rids_中的每个记录位置
+ * 3. 读取原记录并记录写操作（用于回滚）
+ * 4. 根据SET子句构造新记录
+ * 5. 更新涉及的索引（删除旧键，插入新键）
+ * 6. 更新记录文件中的数据
  */
 class UpdateExecutor : public AbstractExecutor {
    private:
@@ -74,20 +76,39 @@ class UpdateExecutor : public AbstractExecutor {
      * @return nullptr（更新操作不返回记录）
      *
      * 更新流程：
-     * 1. 遍历所有需要更新的记录（rids_）
-     * 2. 对于每条记录：
+     * 1. 申请表级意向排他锁（IX锁）
+     * 2. 遍历所有需要更新的记录（rids_）
+     * 3. 对于每条记录：
      *    a. 读取原记录
-     *    b. 根据SET子句构造新记录
-     *    c. 更新涉及的索引（删旧键，插新键）
-     *    d. 更新记录文件中的数据
+     *    b. 记录写操作（用于事务回滚）
+     *    c. 根据SET子句构造新记录
+     *    d. 更新涉及的索引（删旧键，插新键）
+     *    e. 更新记录文件中的数据
+     * 
+     * 加锁说明：
+     * - 更新操作需要申请IX锁，表示将要在某些行上加X锁
+     * - 行级X锁在update_record时自动申请
      */
     std::unique_ptr<RmRecord> Next() override {
-        // 遍历所有需要更新的记录
+        // Step 1: 申请表级意向排他锁（IX锁）
+        // IX锁表示事务将要在该表的某些记录上申请排他锁
+        if (context_ != nullptr && context_->lock_mgr_ != nullptr && context_->txn_ != nullptr) {
+            context_->lock_mgr_->lock_IX_on_table(context_->txn_, fh_->GetFd());
+        }
+        
+        // Step 2: 遍历所有需要更新的记录
         for (auto& rid : rids_) {
-            // Step 1: 读取原记录
+            // Step 2.1: 读取原记录
             auto old_rec = fh_->get_record(rid, context_);
 
-            // Step 2: 构造新记录（复制原记录，然后修改指定列）
+            // Step 2.2: 记录写操作（用于事务回滚）
+            // UPDATE操作需要记录rid和修改前的数据，回滚时用原数据覆盖
+            if (context_ != nullptr && context_->txn_ != nullptr) {
+                WriteRecord* write_record = new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rid, *old_rec);
+                context_->txn_->append_write_record(write_record);
+            }
+
+            // Step 2.3: 构造新记录（复制原记录，然后修改指定列）
             // 先复制原记录的所有数据
             RmRecord new_rec(old_rec->size);
             memcpy(new_rec.data, old_rec->data, old_rec->size);
