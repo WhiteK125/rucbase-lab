@@ -118,7 +118,9 @@ void *client_handler(void *sock_fd) {
         Context *context = new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
         // Lab 3 need to remove transaction part
         // Lab 4 need to restart transaction
-        // SetTransaction(&txn_id, context);
+        // 设置事务：如果没有活跃事务则创建新事务，否则使用已有事务
+        // 这确保了每条SQL语句都在事务上下文中执行
+        SetTransaction(&txn_id, context);
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
@@ -179,11 +181,13 @@ void *client_handler(void *sock_fd) {
         if (write(fd, data_send, offset + 1) == -1) {
             break;
         }
-        // 如果是单条语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
-        // if(context->txn_->get_txn_mode() == false)
-        // {
-        //     txn_manager->commit(context->txn_, context->log_mgr_);
-        // }
+        // 如果是单条语句（非显式事务），需要按照一个完整的事务来执行
+        // 执行完当前语句后，自动提交事务
+        // txn_mode_为false表示是隐式事务（单条SQL语句）
+        if(context->txn_->get_txn_mode() == false)
+        {
+            txn_manager->commit(context->txn_, context->log_mgr_);
+        }
     }
 
     // Clear
